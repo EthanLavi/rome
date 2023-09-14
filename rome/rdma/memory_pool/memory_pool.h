@@ -21,6 +21,8 @@
 #include "rome/rdma/rmalloc/rmalloc.h"
 #include "rome/util/thread_util.h"
 
+#define THREAD_MAX 50
+
 namespace rome::rdma {
 
 using ::rome::rdma::EmptyRdmaAccessor;
@@ -68,6 +70,10 @@ class MemoryPool {
   inline MemoryPool(
       const Peer &self,
       std::unique_ptr<ConnectionManager<channel_type>> connection_manager);
+  
+  ~MemoryPool(){
+    ROME_INFO("Mem pool deallocated");
+  }
 
   class DoorbellBatch {
    public:
@@ -176,6 +182,9 @@ class MemoryPool {
 
   inline absl::Status Init(uint32_t capacity, const std::vector<Peer> &peers);
 
+  /// @brief Identify an op thread to the service "worker" thread. (Must be done before operations can be run)
+  void RegisterThread();
+
   template <typename T>
   remote_ptr<T> Allocate(size_t size = 1);
 
@@ -222,12 +231,18 @@ class MemoryPool {
                            size_t chunk_size, remote_ptr<T> prealloc,
                            std::atomic<bool> *kill = nullptr);
 
+  void WorkerThread();
+
   Peer self_;
 
   std::mutex control_lock_;
   std::mutex rdma_per_read_lock_;
 
+  uint64_t id_gen = 0;
   std::unordered_set<uint64_t> wr_ids;
+  std::unordered_map<std::thread::id, uint64_t> thread_ids;
+  std::condition_variable cond_vars[THREAD_MAX]; // max of "THREAD_MAX" threads, can trivially increase
+  std::mutex mutex_vars[THREAD_MAX];
 
   /// @brief add id to map
   inline void secondaryPollID(uint64_t wc_id, uint64_t org_wr_id){

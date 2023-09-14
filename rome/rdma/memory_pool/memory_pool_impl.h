@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstddef>
 #include <memory>
+#include <thread>
+#include <cstdlib> 
 
 #include "memory_pool.h"
 #include "rome/util/thread_util.h"
@@ -158,28 +160,71 @@ absl::Status MemoryPool::Init(uint32_t capacity,
     ROME_CHECK_OK(ROME_RETURN(got.status()), got);
     conn_info_.emplace(p.id, conn_info_t{conn, got->rkey(), mr_->lkey});
   }
+
+  std::thread t = std::thread([this]{ WorkerThread(); }); // TODO: Can I lower the priority of this thread?
+  t.detach();
   return absl::OkStatus();
+}
+
+void MemoryPool::WorkerThread(){
+    int count = 0; // todo: remove
+    while(true){
+      for(auto it : this->conn_info_){
+        // TODO: Load balance the connections we check. Threads should have a way to let us know what is worth checking
+        // Also might no be an issue? Polling isn't expensive
+        // We also want to consider alerts on poll
+        // Poll from conn
+        conn_info_t info = it.second;
+        ibv_wc wc;
+        count += 1;
+        int poll = ibv_poll_cq(info.conn->id()->send_cq, 1, &wc);
+        if (poll == 0) continue;
+        if (rand() % 1000 == 0){ // todo: remove
+          ROME_INFO("Polling took {}-iterations", count); // todo: remove
+        } // todo: remove
+        count = 0; // todo: remove
+        // We polled something :)
+        ROME_ASSERT(poll == 1 && wc.status == IBV_WC_SUCCESS, "ibv_poll_cq(): {}", (poll < 0 ? strerror(errno) : ibv_wc_status_str(wc.status)));
+        // notify wc.wr_id;
+        this->cond_vars[wc.wr_id].notify_one();
+      }
+    }
+}
+
+void MemoryPool::RegisterThread(){
+    control_lock_.lock();
+    std::thread::id mid = std::this_thread::get_id();
+    if (this->thread_ids.find(mid) != this->thread_ids.end()){
+      ROME_FATAL("Cannot register the same thread twice");
+      return;
+    }
+    if (this->id_gen == 0){ // TODO: tmp for testing (dont want 0 id_gen)
+      this->id_gen++; // TODO: remove
+    } // TODO: remove
+    if (this->id_gen == THREAD_MAX){
+      ROME_FATAL("Increase THREAD_MAX of memory pool");
+      return;
+    }
+    this->thread_ids.insert(std::make_pair(mid, id_gen));
+    this->id_gen++;
+    control_lock_.unlock();
 }
 
 template <typename T>
 remote_ptr<T> MemoryPool::Allocate(size_t size) {
-  //control_lock_.lock();
   // ROME_INFO("Allocating {} bytes ({} {} times)", sizeof(T)*size, sizeof(T), size);
   auto ret = remote_ptr<T>(self_.id,
                        rdma_allocator<T>(rdma_memory_.get()).allocate(size));
-  //control_lock_.unlock();
   return ret;
 }
 
 template <typename T>
 void MemoryPool::Deallocate(remote_ptr<T> p, size_t size) {
-  //control_lock_.lock();
   // ROME_INFO("Deallocating {} bytes ({} {} times)", sizeof(T)*size, sizeof(T), size);
   // else ROME_INFO("Deallocating {} bytes", sizeof(T));
   ROME_ASSERT(p.id() == self_.id,
               "Alloc/dealloc on remote node not implemented...");
   rdma_allocator<T>(rdma_memory_.get()).deallocate(std::to_address(p), size);
-  //control_lock_.unlock();
 }
 
 inline void MemoryPool::Execute(DoorbellBatch *batch) {
@@ -227,18 +272,19 @@ template <typename T>
 void MemoryPool::ReadInternal(remote_ptr<T> ptr, size_t offset, size_t bytes,
                               size_t chunk_size, remote_ptr<T> prealloc,
                               std::atomic<bool> *kill) {
-  control_lock_.lock();
   const int num_chunks =
       bytes % chunk_size ? (bytes / chunk_size) + 1 : bytes / chunk_size;
   const size_t remainder = bytes % chunk_size;
   const bool is_multiple = remainder == 0;
 
   auto info = conn_info_.at(ptr.id());
+  int index_as_id = this->thread_ids[std::this_thread::get_id()];
+
 
   T *local = std::to_address(prealloc);
   ibv_sge sges[num_chunks];
   ibv_send_wr wrs[num_chunks];
-  uint64_t wr_id_done;
+  // uint64_t wr_id_done;
 
   for (int i = 0; i < num_chunks; ++i) {
     auto chunk_offset = offset + i * chunk_size;
@@ -250,8 +296,9 @@ void MemoryPool::ReadInternal(remote_ptr<T> ptr, size_t offset, size_t bytes,
     }
     sges[i].lkey = mr_->lkey;
 
-    wrs[i].wr_id = ++wr_id_gen;
-    wr_id_done = wrs[i].wr_id;
+    wrs[i].wr_id = index_as_id;
+    // wrs[i].wr_id = ++wr_id_gen;
+    // wr_id_done = wrs[i].wr_id;
     wrs[i].num_sge = 1;
     wrs[i].sg_list = &sges[i];
     wrs[i].opcode = IBV_WR_RDMA_READ;
@@ -264,16 +311,26 @@ void MemoryPool::ReadInternal(remote_ptr<T> ptr, size_t offset, size_t bytes,
 
   ibv_send_wr *bad;
   RDMA_CM_ASSERT(ibv_post_send, info.conn->id()->qp, wrs, &bad);
+  
+  std::unique_lock<std::mutex> lck(this->mutex_vars[index_as_id]);
+  this->cond_vars[index_as_id].wait(lck);
+  /*
   ibv_wc wc;
   int poll = 0;
+  // int counter = 0;
   if (kill == nullptr) {
-    for (; poll == 0; poll = ibv_poll_cq(info.conn->id()->send_cq, 1, &wc))
-      ;
+    for (; poll == 0; poll = ibv_poll_cq(info.conn->id()->send_cq, 1, &wc)){
+      // counter += 1;
+    }
     ROME_ASSERT(
         poll == 1 && wc.status == IBV_WC_SUCCESS, "ibv_poll_cq(): {} @ {}",
         (poll < 0 ? strerror(errno) : ibv_wc_status_str(wc.status)), ptr);
+    
+    if (rand() % 1000 == 0){
+      ROME_INFO("Waited {}-loop iterations", counter);
+    }
     if (wc.wr_id != wr_id_done){
-      //secondaryPollID(wc.wr_id, wr_id_done);
+      secondaryPollID(wc.wr_id, wr_id_done);
     }
   } else {
     for (; poll == 0 && !(*kill);
@@ -284,10 +341,10 @@ void MemoryPool::ReadInternal(remote_ptr<T> ptr, size_t offset, size_t bytes,
                  (poll < 0 ? strerror(errno) : ibv_wc_status_str(wc.status)));
     }
     if (poll != 0 && wc.wr_id != wr_id_done){
-      //secondaryPollID(wc.wr_id, wr_id_done);
+      secondaryPollID(wc.wr_id, wr_id_done);
     }
   }
-  control_lock_.unlock();
+  */
   rdma_per_read_lock_.lock();
   rdma_per_read_ << num_chunks;
   rdma_per_read_lock_.unlock();
