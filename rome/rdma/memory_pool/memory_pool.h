@@ -70,10 +70,6 @@ class MemoryPool {
   inline MemoryPool(
       const Peer &self,
       std::unique_ptr<ConnectionManager<channel_type>> connection_manager);
-  
-  ~MemoryPool(){
-    ROME_INFO("Mem pool deallocated");
-  }
 
   class DoorbellBatch {
    public:
@@ -182,9 +178,6 @@ class MemoryPool {
 
   inline absl::Status Init(uint32_t capacity, const std::vector<Peer> &peers);
 
-  /// @brief Identify an op thread to the service "worker" thread. (Must be done before operations can be run)
-  void RegisterThread();
-
   template <typename T>
   remote_ptr<T> Allocate(size_t size = 1);
 
@@ -225,6 +218,12 @@ class MemoryPool {
     return GetRemotePtr<T>(reinterpret_cast<const T *>(mr_->addr));
   }
 
+  /// @brief Identify an op thread to the service "worker" thread. (Must be done before operations can be run)
+  void RegisterThread();
+
+  // Do I need this?
+  void KillWorkerThread();
+
  private:
   template <typename T>
   inline void ReadInternal(remote_ptr<T> ptr, size_t offset, size_t bytes,
@@ -242,21 +241,9 @@ class MemoryPool {
   std::unordered_set<uint64_t> wr_ids;
   std::unordered_map<std::thread::id, uint64_t> thread_ids;
   std::condition_variable cond_vars[THREAD_MAX]; // max of "THREAD_MAX" threads, can trivially increase
+  std::atomic<bool> mailboxes[THREAD_MAX];
+  bool run_worker = true;
   std::mutex mutex_vars[THREAD_MAX];
-
-  /// @brief add id to map
-  inline void secondaryPollID(uint64_t wc_id, uint64_t org_wr_id){
-    control_lock_.lock();
-    wr_ids.insert(wc_id);
-    while(true){
-      if (wr_ids.erase(org_wr_id) == 0) break;
-      control_lock_.unlock();
-      cpu_relax(); // give some time for other threads to poll the queue pair and push into the map
-      control_lock_.lock();
-    }
-    control_lock_.unlock();
-  }
-  std::atomic<uint64_t> wr_id_gen = 0;
 
   std::unique_ptr<ConnectionManager<channel_type>> connection_manager_;
   std::unique_ptr<rdma_memory_resource> rdma_memory_;
