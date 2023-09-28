@@ -177,6 +177,7 @@ void MemoryPool::KillWorkerThread(){
 }
 
 void MemoryPool::WorkerThread(){
+    ROME_INFO("Worker thread");
     while(this->run_worker){
       for(auto it : this->conn_info_){
         // TODO: Load balance the connections we check. Threads should have a way to let us know what is worth checking
@@ -184,16 +185,18 @@ void MemoryPool::WorkerThread(){
 
         // Poll from conn
         conn_info_t info = it.second;
-        ibv_wc wc;
-        int poll = ibv_poll_cq(info.conn->id()->send_cq, 1, &wc);
-        if (poll == 0) continue; 
-
+        ibv_wc wcs[THREAD_MAX];
+        int poll = ibv_poll_cq(info.conn->id()->send_cq, THREAD_MAX, wcs);
+        if (poll == 0) continue;
+        ROME_ASSERT(poll > 0, "ibv_poll_cq(): {}", strerror(errno));
         // We polled something :)
-        ROME_ASSERT(poll == 1 && wc.status == IBV_WC_SUCCESS, "ibv_poll_cq(): {}", (poll < 0 ? strerror(errno) : ibv_wc_status_str(wc.status)));
-        // notify wc.wr_id;
-        std::unique_lock lck(this->mutex_vars[wc.wr_id]);
-        this->mailboxes[wc.wr_id] = true;
-        this->cond_vars[wc.wr_id].notify_one();
+        for(int i = 0; i < poll; i++){
+          ROME_ASSERT(wcs[i].status == IBV_WC_SUCCESS, "ibv_poll_cq(): {}", ibv_wc_status_str(wcs[i].status));
+          // notify wcs[i].wr_id;
+          std::unique_lock lck(this->mutex_vars[wcs[i].wr_id]);
+          this->mailboxes[wcs[i].wr_id] = true;
+          this->cond_vars[wcs[i].wr_id].notify_one();
+        }
       }
     }
 }
