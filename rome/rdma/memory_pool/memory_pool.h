@@ -69,7 +69,8 @@ class MemoryPool {
 
   inline MemoryPool(
       const Peer &self,
-      std::unique_ptr<ConnectionManager<channel_type>> connection_manager);
+      std::unique_ptr<ConnectionManager<channel_type>> connection_manager, 
+      bool is_shared);
 
   class DoorbellBatch {
    public:
@@ -198,9 +199,16 @@ class MemoryPool {
   remote_ptr<T> PartialRead(remote_ptr<T> ptr, size_t offset, size_t bytes,
                             remote_ptr<T> prealloc = remote_nullptr);
 
+  enum RDMAWritePolicy {
+    WaitForResponse,
+    FireAndForget, // If the QP was created with sq_sig_all=1, there won't be any effect to this flag
+  };
+
   template <typename T>
   void Write(remote_ptr<T> ptr, const T &val,
-             remote_ptr<T> prealloc = remote_nullptr);
+             remote_ptr<T> prealloc = remote_nullptr, 
+             RDMAWritePolicy writePolicy = WaitForResponse, 
+             int inline_max_size = -1);
 
   template <typename T>
   T AtomicSwap(remote_ptr<T> ptr, uint64_t swap, uint64_t hint = 0);
@@ -221,7 +229,7 @@ class MemoryPool {
   /// @brief Identify an op thread to the service "worker" thread. (Must be done before operations can be run)
   void RegisterThread();
 
-  // Do I need this?
+  // todo: Do I need this?
   void KillWorkerThread();
 
  private:
@@ -233,6 +241,7 @@ class MemoryPool {
   void WorkerThread();
 
   Peer self_;
+  bool is_shared_;
 
   std::mutex control_lock_;
   std::mutex rdma_per_read_lock_;
